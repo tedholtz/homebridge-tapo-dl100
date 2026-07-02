@@ -186,7 +186,17 @@ export class DlklapApi {
     });
   }
 
-  private async withSession<T>(fn: (s: Session) => Promise<T>): Promise<T> {
+  // Serialize all sessions. A second handshake0 while another is in flight
+  // rotates the device state and invalidates the first (cloud returns 15033).
+  private chain: Promise<unknown> = Promise.resolve();
+
+  private withSession<T>(fn: (s: Session) => Promise<T>): Promise<T> {
+    const task = this.chain.then(() => this.runSession(fn), () => this.runSession(fn));
+    this.chain = task.then(() => undefined, () => undefined);   // keep chain alive
+    return task;
+  }
+
+  private async runSession<T>(fn: (s: Session) => Promise<T>): Promise<T> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
