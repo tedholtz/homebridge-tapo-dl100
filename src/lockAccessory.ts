@@ -47,7 +47,15 @@ export class LockAccessory {
     }
   }
 
-  private async refresh(): Promise<void> {
+  private refreshing?: Promise<void>;
+  private refresh(): Promise<void> {
+    // Coalesce concurrent refreshes (HAP polling + interval + post-set) into one.
+    if (this.refreshing) return this.refreshing;
+    this.refreshing = this.doRefresh().finally(() => { this.refreshing = undefined; });
+    return this.refreshing;
+  }
+
+  private async doRefresh(): Promise<void> {
     try {
       const C = this.platform.Characteristic;
       this.info = await this.api.getDeviceInfo();
@@ -64,8 +72,9 @@ export class LockAccessory {
     }
   }
 
-  private async getCurrent(): Promise<CharacteristicValue> {
-    if (!this.info || Date.now() - this.lastFetch > this.pollMs) await this.refresh();
+  private getCurrent(): CharacteristicValue {
+    // Never block the HomeKit read: return cached state, refresh in background.
+    if (!this.info || Date.now() - this.lastFetch > this.pollMs) void this.refresh();
     return this.mapCurrent(this.info?.lock_status);
   }
 
