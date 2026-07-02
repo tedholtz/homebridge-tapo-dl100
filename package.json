@@ -1,0 +1,16 @@
+{
+  "displayName": "Homebridge Tapo DL100",
+  "name": "homebridge-tapo-dl100",
+  "version": "0.1.0",
+  "description": "HomeKit lock support for the TP-Link Tapo DL100 (DLKLAP)",
+  "license": "MIT",
+  "engines": { "node": ">=18.0.0", "homebridge": ">=1.6.0" },
+  "main": "dist/index.js",
+  "scripts": { "build": "tsc", "watch": "tsc --watch" },
+  "keywords": ["homebridge-plugin", "tapo", "dl100", "lock"],
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "homebridge": "^1.7.0",
+    "typescript": "^5.4.0"
+  }
+}

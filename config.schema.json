@@ -1,0 +1,24 @@
+{
+  "pluginAlias": "TapoDL100",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "locks": {
+        "type": "array", "title": "Locks",
+        "items": { "type": "object", "properties": {
+          "name": { "title": "Name", "type": "string", "default": "Front Door" },
+          "ip": { "title": "Lock IP", "type": "string", "required": true },
+          "deviceId": { "title": "Device ID", "type": "string", "required": true },
+          "terminalUUID": { "title": "Terminal UUID", "type": "string", "required": true },
+          "cloudUsername": { "title": "TP-Link Email", "type": "string", "required": true },
+          "cloudPassword": { "title": "TP-Link Password", "type": "string", "required": true },
+          "accountId": { "title": "Account ID (optional)", "type": "string" },
+          "pollSeconds": { "title": "Poll interval (s)", "type": "integer", "default": 300 },
+          "insecureTLS": { "title": "Disable TLS verify (debug only)", "type": "boolean", "default": false }
+        } }
+      }
+    }
+  }
+}
