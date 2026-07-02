@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import net from 'net';
+import https from 'https';
 
 export interface DlklapConfig {
   ip: string;
@@ -74,6 +75,43 @@ function tcpProbe(ip: string, port: number, timeoutMs: number): Promise<boolean>
     s.once('timeout', () => done(false));
     s.once('error', () => done(false));
     s.connect(port, ip);
+  });
+}
+
+// POST JSON over HTTPS with a per-call TLS trust setting. Node's global fetch
+// can't relax TLS without pulling in undici, so we use node:https here. Needed
+// because TP-Link's app-server presents a private-CA ("self-signed") chain.
+function httpsPostJson(
+  url: string,
+  headers: Record<string, string>,
+  bodyObj: unknown,
+  rejectUnauthorized: boolean,
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const data = Buffer.from(JSON.stringify(bodyObj), 'utf8');
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: { ...headers, 'Content-Length': String(data.length) },
+        rejectUnauthorized,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c as Buffer));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          try { resolve(JSON.parse(text)); }
+          catch { reject(new Error(`bad JSON (HTTP ${res.statusCode}): ${text.slice(0, 200)}`)); }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(data);
+    req.end();
   });
 }
 
@@ -158,7 +196,9 @@ export class DlklapApi {
         return await fn(session);
       } catch (e) {
         lastErr = e;
-        this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}`);
+        const cause = (e as any)?.cause;
+        const causeStr = cause ? ` | cause: ${cause.code ?? ''} ${cause.message ?? cause}` : '';
+        this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}${causeStr}`);
         this.token = undefined;         // force re-login + fresh handshake
         await sleep(500);
       }
@@ -203,19 +243,22 @@ export class DlklapApi {
     if (!hs0.ok) throw new Error(`handshake0 HTTP ${hs0.status}`);
     const secret = (await hs0.text()).trim();
 
-    // cloud control-key (bound to THIS handshake0)
-    const ckRes = await (await fetch(
-      `https://use1-app-server.iot.i.tplinknbu.com/v1/things/${this.cfg.deviceId}/control-key`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `ut|${this.token}`,
-          'app-cid': `app:Tapo_Android:${this.cfg.terminalUUID}`,
-          'App-Type': 'Tapo_Android', 'x-app-name': 'Tapo_Android',
-          'UUID': this.cfg.terminalUUID, 'Terminal-Id': this.cfg.terminalUUID, 'x-term-id': this.cfg.terminalUUID,
-          'Platform': 'ANDROID', 'X-App-Os': 'android', 'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ secret, random: rand4.toString('hex').toUpperCase() }),
-      })).json() as Json;
+    // cloud control-key (bound to THIS handshake0).
+    // TP-Link's app-server uses a private CA ("self-signed" to public roots), so
+    // this single call skips TLS verification via node:https. The login call
+    // above (which carries the account password) stays fully verified.
+    const ckRes = await httpsPostJson(
+      `https://use1-app-server.iot.i.tplinknbu.com/v1/things/${this.cfg.deviceId}/control-key`,
+      {
+        'Authorization': `ut|${this.token}`,
+        'app-cid': `app:Tapo_Android:${this.cfg.terminalUUID}`,
+        'App-Type': 'Tapo_Android', 'x-app-name': 'Tapo_Android',
+        'UUID': this.cfg.terminalUUID, 'Terminal-Id': this.cfg.terminalUUID, 'x-term-id': this.cfg.terminalUUID,
+        'Platform': 'ANDROID', 'X-App-Os': 'android', 'Content-Type': 'application/json',
+      },
+      { secret, random: rand4.toString('hex').toUpperCase() },
+      false,   // TP-Link private CA -> can't verify against public roots
+    ) as Json;
     const ckObj = ckRes.result ?? ckRes.data ?? ckRes;
     const controlKey: string | undefined = ckObj.controlKey ?? ckObj.control_key;
     if (!controlKey) throw new Error(`control-key missing: ${JSON.stringify(ckRes)}`);
