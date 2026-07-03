@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import net from 'net';
+import http from 'http';
 import https from 'https';
 
 export interface DlklapConfig {
@@ -9,7 +10,6 @@ export interface DlklapConfig {
   cloudUsername: string;
   cloudPassword: string;
   accountId?: string;      // taken from login if omitted
-  insecureTLS?: boolean;   // DEBUG ONLY (e.g. mitmproxy CA present)
 }
 
 export interface DeviceInfo {
@@ -46,7 +46,7 @@ function aesDecrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
   return Buffer.concat([d.update(data), d.final()]);
 }
 
-// Robustly pull the first complete JSON object out of the decrypted body
+// Pull the first complete JSON object out of the decrypted body
 // (there is a ~4-byte prefix before the '{').
 function extractJson(buf: Buffer): Json {
   const s = buf.toString('utf8');
@@ -65,6 +65,40 @@ function extractJson(buf: Buffer): Json {
   throw new Error('no complete JSON object in response');
 }
 
+// Raw HTTP(S) POST via node's http/https. We do NOT use global fetch: undici
+// mangles the DL100 handshake (the 33-byte binary hs0 body) and the cloud then
+// rejects the secret with 15033. node:http reproduces step9.py exactly.
+function req(
+  urlStr: string,
+  opts: { headers?: Record<string, string>; body?: Buffer | string | null; rejectUnauthorized?: boolean } = {},
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; buf: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const lib = u.protocol === 'https:' ? https : http;
+    const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+    const body = opts.body ?? null;
+    if (body != null) headers['Content-Length'] = String(Buffer.byteLength(body as Buffer));
+    const r = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers,
+        rejectUnauthorized: opts.rejectUnauthorized ?? true,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c as Buffer));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, buf: Buffer.concat(chunks) }));
+      },
+    );
+    r.on('error', reject);
+    if (body != null) r.write(body);
+    r.end();
+  });
+}
+
 // TCP-connect wake probe (mirrors `nc` / socket.create_connection).
 function tcpProbe(ip: string, port: number, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -75,43 +109,6 @@ function tcpProbe(ip: string, port: number, timeoutMs: number): Promise<boolean>
     s.once('timeout', () => done(false));
     s.once('error', () => done(false));
     s.connect(port, ip);
-  });
-}
-
-// POST JSON over HTTPS with a per-call TLS trust setting. Node's global fetch
-// can't relax TLS without pulling in undici, so we use node:https here. Needed
-// because TP-Link's app-server presents a private-CA ("self-signed") chain.
-function httpsPostJson(
-  url: string,
-  headers: Record<string, string>,
-  bodyObj: unknown,
-  rejectUnauthorized: boolean,
-): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const data = Buffer.from(JSON.stringify(bodyObj), 'utf8');
-    const req = https.request(
-      {
-        hostname: u.hostname,
-        port: u.port || 443,
-        path: u.pathname + u.search,
-        method: 'POST',
-        headers: { ...headers, 'Content-Length': String(data.length) },
-        rejectUnauthorized,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(c as Buffer));
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          try { resolve(JSON.parse(text)); }
-          catch { reject(new Error(`bad JSON (HTTP ${res.statusCode}): ${text.slice(0, 200)}`)); }
-        });
-      },
-    );
-    req.on('error', reject);
-    req.write(data);
-    req.end();
   });
 }
 
@@ -139,20 +136,18 @@ class Session {
     const ct = aesEncrypt(this.lsk, iv, pkcs7pad(pt));
     const mac = sha(this.ldk, seqB, ct);                 // KLAP seq4 form
     const body = Buffer.concat([mac, ct]);
-    const res = await fetch(`http://${this.ip}:80/app/request?seq=${this.seq}`, {
-      method: 'POST',
+    const res = await req(`http://${this.ip}:80/app/request?seq=${this.seq}`, {
       headers: {
-        'Referer': `http://${this.ip}:80/`,
-        'Accept': 'application/json',
-        'requestByApp': 'true',
+        Referer: `http://${this.ip}:80/`,
+        Accept: 'application/json',
+        requestByApp: 'true',
         'Content-Type': 'text/plain',
-        'Cookie': this.cookie,
+        Cookie: this.cookie,
       },
-      body: new Uint8Array(body),
+      body,
     });
     if (res.status !== 200) throw new Error(`/app/request HTTP ${res.status} (seq=${this.seq})`);
-    const data = Buffer.from(await res.arrayBuffer());
-    const dec = pkcs7unpad(aesDecrypt(this.lsk, iv, data.subarray(32)));
+    const dec = pkcs7unpad(aesDecrypt(this.lsk, iv, res.buf.subarray(32)));
     return extractJson(dec);
   }
 }
@@ -160,16 +155,13 @@ class Session {
 export class DlklapApi {
   private token?: string;
   private accountId?: string;
+  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(
     private cfg: DlklapConfig,
     private log: { debug: (m: string) => void; warn: (m: string) => void; error: (m: string) => void },
   ) {
     if (cfg.accountId) this.accountId = cfg.accountId;
-    if (cfg.insecureTLS) {
-      this.log.warn('insecureTLS enabled — TLS verification disabled (debug only!)');
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-    }
   }
 
   async getDeviceInfo(): Promise<DeviceInfo> {
@@ -186,13 +178,11 @@ export class DlklapApi {
     });
   }
 
-  // Serialize all sessions. A second handshake0 while another is in flight
-  // rotates the device state and invalidates the first (cloud returns 15033).
-  private chain: Promise<unknown> = Promise.resolve();
-
+  // Serialize sessions: a second handshake0 while one is in flight rotates the
+  // device state and invalidates the first (cloud returns 15033).
   private withSession<T>(fn: (s: Session) => Promise<T>): Promise<T> {
     const task = this.chain.then(() => this.runSession(fn), () => this.runSession(fn));
-    this.chain = task.then(() => undefined, () => undefined);   // keep chain alive
+    this.chain = task.then(() => undefined, () => undefined);
     return task;
   }
 
@@ -206,10 +196,8 @@ export class DlklapApi {
         return await fn(session);
       } catch (e) {
         lastErr = e;
-        const cause = (e as any)?.cause;
-        const causeStr = cause ? ` | cause: ${cause.code ?? ''} ${cause.message ?? cause}` : '';
-        this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}${causeStr}`);
-        this.token = undefined;         // force re-login + fresh handshake
+        this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}`);
+        this.token = undefined;
         await sleep(500);
       }
     }
@@ -226,13 +214,14 @@ export class DlklapApi {
 
   private async ensureToken(): Promise<void> {
     if (this.token) return;
-    const body = { method: 'login', params: {
+    const body = JSON.stringify({ method: 'login', params: {
       appType: 'Tapo_Android', cloudUserName: this.cfg.cloudUsername,
       cloudPassword: this.cfg.cloudPassword, terminalUUID: this.cfg.terminalUUID,
-      refreshTokenNeeded: false } };
-    const r = await (await fetch('https://wap.tplinkcloud.com/', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    })).json() as Json;
+      refreshTokenNeeded: false } });
+    const res = await req('https://wap.tplinkcloud.com/', {
+      headers: { 'Content-Type': 'application/json' }, body,
+    });
+    const r = JSON.parse(res.buf.toString('utf8')) as Json;
     if (r.error_code !== 0) throw new Error(`login failed: ${JSON.stringify(r)}`);
     this.token = r.result.token;
     this.accountId = this.accountId ?? String(r.result.accountId);
@@ -241,34 +230,35 @@ export class DlklapApi {
   // handshake0 -> cloud control-key -> handshake1/2 -> derive session keys
   private async handshake(): Promise<Session> {
     const base = `http://${this.cfg.ip}:80`;
-    const localHeaders = { 'Content-Type': 'text/plain', 'Referer': `${base}/` };
+    const localHeaders = { 'Content-Type': 'text/plain', Referer: `${base}/` };
 
     // handshake0 (33-byte body = sha((rand4hex+accountId).upper()) + ROLE=0)
     const rand4 = crypto.randomBytes(4);
     const digest = sha(Buffer.from((rand4.toString('hex') + this.accountId).toUpperCase(), 'ascii'));
-    const hs0 = await fetch(`${base}/app/handshake0`, {
-      method: 'POST', headers: localHeaders,
-      body: new Uint8Array(Buffer.concat([digest.subarray(0, 32), Buffer.from([0])])),
+    const hs0 = await req(`${base}/app/handshake0`, {
+      headers: localHeaders,
+      body: Buffer.concat([digest.subarray(0, 32), Buffer.from([0])]),
     });
-    if (!hs0.ok) throw new Error(`handshake0 HTTP ${hs0.status}`);
-    const secret = (await hs0.text()).trim();
+    if (hs0.status !== 200) throw new Error(`handshake0 HTTP ${hs0.status}`);
+    const secret = hs0.buf.toString('utf8').trim();
 
-    // cloud control-key (bound to THIS handshake0).
-    // TP-Link's app-server uses a private CA ("self-signed" to public roots), so
-    // this single call skips TLS verification via node:https. The login call
-    // above (which carries the account password) stays fully verified.
-    const ckRes = await httpsPostJson(
+    // cloud control-key (bound to THIS handshake0). TP-Link's app-server uses a
+    // private CA, so this call sets rejectUnauthorized:false; login stays verified.
+    const ckRaw = await req(
       `https://use1-app-server.iot.i.tplinknbu.com/v1/things/${this.cfg.deviceId}/control-key`,
       {
-        'Authorization': `ut|${this.token}`,
-        'app-cid': `app:Tapo_Android:${this.cfg.terminalUUID}`,
-        'App-Type': 'Tapo_Android', 'x-app-name': 'Tapo_Android',
-        'UUID': this.cfg.terminalUUID, 'Terminal-Id': this.cfg.terminalUUID, 'x-term-id': this.cfg.terminalUUID,
-        'Platform': 'ANDROID', 'X-App-Os': 'android', 'Content-Type': 'application/json',
+        headers: {
+          Authorization: `ut|${this.token}`,
+          'app-cid': `app:Tapo_Android:${this.cfg.terminalUUID}`,
+          'App-Type': 'Tapo_Android', 'x-app-name': 'Tapo_Android',
+          UUID: this.cfg.terminalUUID, 'Terminal-Id': this.cfg.terminalUUID, 'x-term-id': this.cfg.terminalUUID,
+          Platform: 'ANDROID', 'X-App-Os': 'android', 'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ secret, random: rand4.toString('hex').toUpperCase() }),
+        rejectUnauthorized: false,
       },
-      { secret, random: rand4.toString('hex').toUpperCase() },
-      false,   // TP-Link private CA -> can't verify against public roots
-    ) as Json;
+    );
+    const ckRes = JSON.parse(ckRaw.buf.toString('utf8')) as Json;
     const ckObj = ckRes.result ?? ckRes.data ?? ckRes;
     const controlKey: string | undefined = ckObj.controlKey ?? ckObj.control_key;
     if (!controlKey) throw new Error(`control-key missing: ${JSON.stringify(ckRes)}`);
@@ -277,27 +267,27 @@ export class DlklapApi {
     const ck = Buffer.from(controlKey.toUpperCase(), 'ascii');   // 64 ASCII bytes, owner raw
     const lmk = sha(ck);
     const L = crypto.randomBytes(16);
-    const hs1 = await fetch(`${base}/app/handshake1`, {
-      method: 'POST', headers: localHeaders,
-      body: new Uint8Array(Buffer.concat([L, sha(Buffer.concat([L, ck]))])),
+    const hs1 = await req(`${base}/app/handshake1`, {
+      headers: localHeaders,
+      body: Buffer.concat([L, sha(Buffer.concat([L, ck]))]),
     });
-    if (!hs1.ok) throw new Error(`handshake1 HTTP ${hs1.status}`);
-    const m = /TP_SESSIONID=[^;]+/.exec(hs1.headers.get('set-cookie') ?? '');
+    if (hs1.status !== 200) throw new Error(`handshake1 HTTP ${hs1.status}`);
+    const setCookie = (hs1.headers['set-cookie'] ?? []).join('; ');
+    const m = /TP_SESSIONID=[^;]+/.exec(setCookie);
     if (!m) throw new Error('no TP_SESSIONID cookie on handshake1');
     const cookie = m[0];
-    const hs1Body = Buffer.from(await hs1.arrayBuffer());
-    const R = hs1Body.subarray(0, 16);
-    const serverProof = hs1Body.subarray(16, 48);
+    const R = hs1.buf.subarray(0, 16);
+    const serverProof = hs1.buf.subarray(16, 48);
     if (!sha(Buffer.concat([L, R, lmk])).equals(serverProof)) {
       throw new Error('handshake1 server proof mismatch (bad control key / stale hs0?)');
     }
 
     // handshake2
-    const hs2 = await fetch(`${base}/app/handshake2`, {
-      method: 'POST', headers: { ...localHeaders, 'Cookie': cookie },
-      body: new Uint8Array(sha(Buffer.concat([R, L, lmk]))),
+    const hs2 = await req(`${base}/app/handshake2`, {
+      headers: { ...localHeaders, Cookie: cookie },
+      body: sha(Buffer.concat([R, L, lmk])),
     });
-    if (!hs2.ok) throw new Error(`handshake2 HTTP ${hs2.status}`);
+    if (hs2.status !== 200) throw new Error(`handshake2 HTTP ${hs2.status}`);
 
     // derive session keys
     const kdf = (tag: string) => sha(Buffer.concat([Buffer.from(tag, 'ascii'), L, R, lmk]));
