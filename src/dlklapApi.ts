@@ -46,7 +46,7 @@ function aesDecrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
   return Buffer.concat([d.update(data), d.final()]);
 }
 
-// Pull the first complete JSON object out of the decrypted body
+// Robustly pull the first complete JSON object out of the decrypted body
 // (there is a ~4-byte prefix before the '{').
 function extractJson(buf: Buffer): Json {
   const s = buf.toString('utf8');
@@ -63,6 +63,19 @@ function extractJson(buf: Buffer): Json {
     else if (ch === '}' && --depth === 0) return JSON.parse(s.slice(start, i + 1));
   }
   throw new Error('no complete JSON object in response');
+}
+
+// TCP-connect wake probe (mirrors `nc` / socket.create_connection).
+function tcpProbe(ip: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    const done = (v: boolean) => { s.destroy(); resolve(v); };
+    s.setTimeout(timeoutMs);
+    s.once('connect', () => done(true));
+    s.once('timeout', () => done(false));
+    s.once('error', () => done(false));
+    s.connect(port, ip);
+  });
 }
 
 // Raw HTTP(S) POST via node's http/https. We do NOT use global fetch: undici
@@ -96,19 +109,6 @@ function req(
     r.on('error', reject);
     if (body != null) r.write(body);
     r.end();
-  });
-}
-
-// TCP-connect wake probe (mirrors `nc` / socket.create_connection).
-function tcpProbe(ip: string, port: number, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const s = new net.Socket();
-    const done = (v: boolean) => { s.destroy(); resolve(v); };
-    s.setTimeout(timeoutMs);
-    s.once('connect', () => done(true));
-    s.once('timeout', () => done(false));
-    s.once('error', () => done(false));
-    s.connect(port, ip);
   });
 }
 
@@ -155,7 +155,6 @@ class Session {
 export class DlklapApi {
   private token?: string;
   private accountId?: string;
-  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(
     private cfg: DlklapConfig,
@@ -172,17 +171,19 @@ export class DlklapApi {
   async setLock(locked: boolean): Promise<void> {
     await this.withSession(async (s) => {
       const r = await s.call([{ method: 'setLockStatus',
-        params: { lock_status: locked ? 1 : 0, sa_user_id: 'local_1' } }]);
+        params: { lock_status: locked ? 0 : 1, sa_user_id: 'local_1' } }]);  // 0 = lock (bolt out), 1 = unlock (bolt in)
       const resp = r.result?.responses?.[0];
       if (resp?.error_code !== 0) throw new Error(`setLockStatus failed: ${JSON.stringify(r)}`);
     });
   }
 
-  // Serialize sessions: a second handshake0 while one is in flight rotates the
-  // device state and invalidates the first (cloud returns 15033).
+  // Serialize all sessions. A second handshake0 while another is in flight
+  // rotates the device state and invalidates the first (cloud returns 15033).
+  private chain: Promise<unknown> = Promise.resolve();
+
   private withSession<T>(fn: (s: Session) => Promise<T>): Promise<T> {
     const task = this.chain.then(() => this.runSession(fn), () => this.runSession(fn));
-    this.chain = task.then(() => undefined, () => undefined);
+    this.chain = task.then(() => undefined, () => undefined);   // keep chain alive
     return task;
   }
 
@@ -196,8 +197,10 @@ export class DlklapApi {
         return await fn(session);
       } catch (e) {
         lastErr = e;
-        this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}`);
-        this.token = undefined;
+        const cause = (e as any)?.cause;
+        const causeStr = cause ? ` | cause: ${cause.code ?? ''} ${cause.message ?? cause}` : '';
+        this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}${causeStr}`);
+        this.token = undefined;         // force re-login + fresh handshake
         await sleep(500);
       }
     }
@@ -214,12 +217,12 @@ export class DlklapApi {
 
   private async ensureToken(): Promise<void> {
     if (this.token) return;
-    const body = JSON.stringify({ method: 'login', params: {
+    const body = { method: 'login', params: {
       appType: 'Tapo_Android', cloudUserName: this.cfg.cloudUsername,
       cloudPassword: this.cfg.cloudPassword, terminalUUID: this.cfg.terminalUUID,
-      refreshTokenNeeded: false } });
+      refreshTokenNeeded: false } };
     const res = await req('https://wap.tplinkcloud.com/', {
-      headers: { 'Content-Type': 'application/json' }, body,
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
     const r = JSON.parse(res.buf.toString('utf8')) as Json;
     if (r.error_code !== 0) throw new Error(`login failed: ${JSON.stringify(r)}`);
@@ -242,8 +245,10 @@ export class DlklapApi {
     if (hs0.status !== 200) throw new Error(`handshake0 HTTP ${hs0.status}`);
     const secret = hs0.buf.toString('utf8').trim();
 
-    // cloud control-key (bound to THIS handshake0). TP-Link's app-server uses a
-    // private CA, so this call sets rejectUnauthorized:false; login stays verified.
+    // cloud control-key (bound to THIS handshake0).
+    // TP-Link's app-server uses a private CA ("self-signed" to public roots), so
+    // this single call skips TLS verification via node:https. The login call
+    // above (which carries the account password) stays fully verified.
     const ckRaw = await req(
       `https://use1-app-server.iot.i.tplinknbu.com/v1/things/${this.cfg.deviceId}/control-key`,
       {
@@ -255,7 +260,7 @@ export class DlklapApi {
           Platform: 'ANDROID', 'X-App-Os': 'android', 'Content-Type': 'application/json',
         },
         body: JSON.stringify({ secret, random: rand4.toString('hex').toUpperCase() }),
-        rejectUnauthorized: false,
+        rejectUnauthorized: false,   // TP-Link private CA
       },
     );
     const ckRes = JSON.parse(ckRaw.buf.toString('utf8')) as Json;

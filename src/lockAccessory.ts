@@ -40,8 +40,8 @@ export class LockAccessory {
   private mapCurrent(lockStatus?: number): CharacteristicValue {
     const C = this.platform.Characteristic.LockCurrentState;
     switch (lockStatus) {
-      case 0: return C.UNSECURED;
-      case 1: return C.SECURED;
+      case 1: return C.UNSECURED;   // lock_status 1 = bolt retracted = unlocked
+      case 0: return C.SECURED;     // lock_status 0 = bolt extended = locked
       case 3: case 4: return C.JAMMED;
       default: return C.UNKNOWN;
     }
@@ -80,7 +80,7 @@ export class LockAccessory {
 
   private getTarget(): CharacteristicValue {
     const T = this.platform.Characteristic.LockTargetState;
-    return this.info?.lock_status === 1 ? T.SECURED : T.UNSECURED;
+    return this.info?.lock_status === 0 ? T.SECURED : T.UNSECURED;  // 0 = bolt out = locked
   }
 
   private async setTarget(value: CharacteristicValue): Promise<void> {
