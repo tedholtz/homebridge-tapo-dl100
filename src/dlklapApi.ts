@@ -192,7 +192,7 @@ export class DlklapApi {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         await this.ensureToken();
-        await this.ensureAwake();
+        // ensureAwake() removed: lock responds to handshake0 directly (~1.1s cold, verified 2026-07-21).
         const session = await this.handshake();
         return await fn(session);
       } catch (e) {

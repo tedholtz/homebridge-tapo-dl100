@@ -7,6 +7,7 @@ export class LockAccessory {
   private batteryService: Service;
   private info?: DeviceInfo;
   private lastFetch = 0;
+  private _targetState?: CharacteristicValue;
 
   constructor(
     private readonly platform: TapoDL100Platform,
@@ -80,15 +81,41 @@ export class LockAccessory {
 
   private getTarget(): CharacteristicValue {
     const T = this.platform.Characteristic.LockTargetState;
-    return this.info?.lock_status === 0 ? T.SECURED : T.UNSECURED;  // 0 = bolt out = locked
+    // Return the in-flight intended state if set; otherwise derive from last known info.
+    if (this._targetState !== undefined) return this._targetState;
+    return this.info?.lock_status === 0 ? T.SECURED : T.UNSECURED;
   }
 
   private async setTarget(value: CharacteristicValue): Promise<void> {
-    const T = this.platform.Characteristic.LockTargetState;
+    const { Characteristic: C } = this.platform;
+    const T = C.LockTargetState;
     const locked = value === T.SECURED;
+
     this.platform.log.info(`Setting lock -> ${locked ? 'SECURED' : 'UNSECURED'}`);
-    await this.api.setLock(locked);
-    await new Promise((r) => setTimeout(r, 3000));   // let the bolt move
-    await this.refresh();
+
+    // 1. Optimistically update the tile immediately so the UI reflects intent.
+    this._targetState = value;
+    this.lockService.updateCharacteristic(C.LockTargetState, value);
+    this.lockService.updateCharacteristic(
+      C.LockCurrentState,
+      locked ? C.LockCurrentState.SECURED : C.LockCurrentState.UNSECURED
+    );
+
+    try {
+      await this.api.setLock(locked);
+      await new Promise((r) => setTimeout(r, 3000)); // wait for bolt to move
+
+      // 2. Force a fresh (non-coalesced) refresh to get real device state.
+      this.refreshing = undefined;
+      await this.refresh();
+    } catch (e) {
+      this.platform.log.error(`setLock failed: ${(e as Error).message}`);
+      // Revert optimistic update on failure.
+      this._targetState = undefined;
+      void this.refresh();
+    } finally {
+      // Clear the in-flight target so getTarget() falls back to polled state.
+      this._targetState = undefined;
+    }
   }
 }
