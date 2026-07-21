@@ -63,8 +63,9 @@ export class LockAccessory {
       this.lastFetch = Date.now();
       this.lockService.updateCharacteristic(C.LockCurrentState, this.mapCurrent(this.info.lock_status));
       if (this.info.lock_status === 0 || this.info.lock_status === 1) {
+        // lock_status 0 = bolt extended = LOCKED (SECURED); 1 = bolt retracted = UNLOCKED (UNSECURED)
         this.lockService.updateCharacteristic(C.LockTargetState,
-          this.info.lock_status === 1 ? C.LockTargetState.SECURED : C.LockTargetState.UNSECURED);
+          this.info.lock_status === 0 ? C.LockTargetState.SECURED : C.LockTargetState.UNSECURED);
       }
       this.batteryService.updateCharacteristic(C.BatteryLevel, this.info.battery_percentage ?? 100);
       this.batteryService.updateCharacteristic(C.StatusLowBattery, this.info.at_low_battery ? 1 : 0);
