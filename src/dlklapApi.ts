@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import net from 'net';
 import http from 'http';
 import https from 'https';
 
@@ -17,7 +16,6 @@ export interface DeviceInfo {
   battery_percentage?: number;
   at_low_battery?: boolean;
   rssi?: number;
-  auto_lock_time?: number;   // device-reported auto-lock timeout in seconds, if supported
   [k: string]: unknown;
 }
 
@@ -64,19 +62,6 @@ function extractJson(buf: Buffer): Json {
     else if (ch === '}' && --depth === 0) return JSON.parse(s.slice(start, i + 1));
   }
   throw new Error('no complete JSON object in response');
-}
-
-// TCP-connect wake probe (mirrors `nc` / socket.create_connection).
-function tcpProbe(ip: string, port: number, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const s = new net.Socket();
-    const done = (v: boolean) => { s.destroy(); resolve(v); };
-    s.setTimeout(timeoutMs);
-    s.once('connect', () => done(true));
-    s.once('timeout', () => done(false));
-    s.once('error', () => done(false));
-    s.connect(port, ip);
-  });
 }
 
 // Raw HTTP(S) POST via node's http/https. We do NOT use global fetch: undici
@@ -212,14 +197,6 @@ export class DlklapApi {
       }
     }
     throw lastErr;
-  }
-
-  private async ensureAwake(): Promise<void> {
-    for (let i = 0; i < 40; i++) {
-      if (await tcpProbe(this.cfg.ip, 80, 600)) return;
-      await sleep(200);
-    }
-    throw new Error(`lock ${this.cfg.ip}:80 unreachable (never woke)`);
   }
 
   private async ensureToken(): Promise<void> {
