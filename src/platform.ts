@@ -8,7 +8,6 @@ import { LockAccessory } from './lockAccessory';
 interface LockConfigEntry extends DlklapConfig {
   name: string;
   pollSeconds?: number;
-  autoLockSeconds?: number;   // fallback if device doesn't report auto_lock_time; 0 = unknown
 }
 
 export class TapoDL100Platform implements DynamicPlatformPlugin {
@@ -47,7 +46,7 @@ export class TapoDL100Platform implements DynamicPlatformPlugin {
         warn: (m) => this.log.warn(m),
         error: (m) => this.log.error(m),
       });
-      new LockAccessory(this, accessory, dl, (lock.pollSeconds ?? 300) * 1000, lock.autoLockSeconds ?? 0);
+      new LockAccessory(this, accessory, dl, (lock.pollSeconds ?? 300) * 1000);
     }
   }
 }
