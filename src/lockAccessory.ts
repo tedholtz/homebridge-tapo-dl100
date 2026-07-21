@@ -8,6 +8,7 @@ export class LockAccessory {
   private info?: DeviceInfo;
   private lastFetch = 0;
   private _targetState?: CharacteristicValue;
+  private _currentState?: CharacteristicValue;
 
   constructor(
     private readonly platform: TapoDL100Platform,
@@ -75,6 +76,8 @@ export class LockAccessory {
   }
 
   private getCurrent(): CharacteristicValue {
+    // Return in-flight optimistic state if set (prevents HomeKit's post-set GET from reverting the tile).
+    if (this._currentState !== undefined) return this._currentState;
     // Never block the HomeKit read: return cached state, refresh in background.
     if (!this.info || Date.now() - this.lastFetch > this.pollMs) void this.refresh();
     return this.mapCurrent(this.info?.lock_status);
@@ -95,12 +98,12 @@ export class LockAccessory {
     this.platform.log.info(`Setting lock -> ${locked ? 'SECURED' : 'UNSECURED'}`);
 
     // 1. Optimistically update the tile immediately so the UI reflects intent.
+    //    Both _targetState and _currentState are cached so that HomeKit's immediate
+    //    post-set GET calls return the optimistic value instead of reverting the tile.
     this._targetState = value;
+    this._currentState = locked ? C.LockCurrentState.SECURED : C.LockCurrentState.UNSECURED;
     this.lockService.updateCharacteristic(C.LockTargetState, value);
-    this.lockService.updateCharacteristic(
-      C.LockCurrentState,
-      locked ? C.LockCurrentState.SECURED : C.LockCurrentState.UNSECURED
-    );
+    this.lockService.updateCharacteristic(C.LockCurrentState, this._currentState);
 
     try {
       await this.api.setLock(locked);
@@ -111,12 +114,14 @@ export class LockAccessory {
       await this.refresh();
     } catch (e) {
       this.platform.log.error(`setLock failed: ${(e as Error).message}`);
-      // Revert optimistic update on failure.
+      // Revert optimistic updates on failure.
       this._targetState = undefined;
+      this._currentState = undefined;
       void this.refresh();
     } finally {
-      // Clear the in-flight target so getTarget() falls back to polled state.
+      // Clear in-flight states so getCurrent()/getTarget() fall back to polled data.
       this._targetState = undefined;
+      this._currentState = undefined;
     }
   }
 }
