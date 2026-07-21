@@ -8,16 +8,11 @@
       "locks": {
         "type": "array", "title": "Locks",
         "items": { "type": "object", "properties": {
-          "name": { "title": "Name", "type": "string", "default": "Front Door" },
-          "ip": { "title": "Lock IP", "type": "string", "required": true },
-          "deviceId": { "title": "Device ID", "type": "string", "required": true },
-          "terminalUUID": { "title": "Terminal UUID", "type": "string", "required": true },
-          "cloudUsername": { "title": "TP-Link Email", "type": "string", "required": true },
-          "cloudPassword": { "title": "TP-Link Password", "type": "string", "required": true },
-          "accountId": { "title": "Account ID (optional)", "type": "string" },
-          "pollSeconds": { "title": "Poll interval (s)", "type": "integer", "default": 300 },
-          "autoLockSeconds": { "title": "Auto-lock timeout (s, 0 = unknown)", "type": "integer", "default": 0 },
-          "insecureTLS": { "title": "Disable TLS verify (debug only)", "type": "boolean", "default": false }
+          "name": { "title": "Name (match Tapo app name exactly)", "type": "string", "default": "Front Door" },
+          "ip": { "title": "Lock IP address", "type": "string", "required": true },
+          "cloudUsername": { "title": "TP-Link / Tapo email", "type": "string", "required": true },
+          "cloudPassword": { "title": "TP-Link / Tapo password", "type": "string", "required": true },
+          "pollSeconds": { "title": "Poll interval (s)", "type": "integer", "default": 300 }
         } }
       }
     }

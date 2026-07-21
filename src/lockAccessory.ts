@@ -15,6 +15,7 @@ export class LockAccessory {
     private readonly accessory: PlatformAccessory,
     private readonly api: DlklapApi,
     private readonly pollMs: number,
+    private readonly onFirstSuccess?: () => void,
   ) {
     const { Service: S, Characteristic: C } = this.platform;
 
@@ -50,6 +51,7 @@ export class LockAccessory {
   }
 
   private refreshing?: Promise<void>;
+  private didPersist = false;
   private refresh(): Promise<void> {
     // Coalesce concurrent refreshes (HAP polling + interval + post-set) into one.
     if (this.refreshing) return this.refreshing;
@@ -61,6 +63,7 @@ export class LockAccessory {
     try {
       const C = this.platform.Characteristic;
       this.info = await this.api.getDeviceInfo();
+      if (!this.didPersist) { this.didPersist = true; this.onFirstSuccess?.(); }
       this.lastFetch = Date.now();
       this.lockService.updateCharacteristic(C.LockCurrentState, this.mapCurrent(this.info.lock_status));
       if (this.info.lock_status === 0 || this.info.lock_status === 1) {

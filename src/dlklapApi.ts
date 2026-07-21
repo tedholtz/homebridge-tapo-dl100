@@ -4,11 +4,11 @@ import https from 'https';
 
 export interface DlklapConfig {
   ip: string;
-  deviceId: string;
-  terminalUUID: string;
   cloudUsername: string;
   cloudPassword: string;
-  accountId?: string;      // taken from login if omitted
+  // Resolved at runtime — not user-facing config fields.
+  _terminalUUID?: string;  // generated once, persisted in accessory context
+  _deviceId?: string;      // discovered from cloud device list, persisted in accessory context
 }
 
 export interface DeviceInfo {
@@ -146,9 +146,12 @@ export class DlklapApi {
   constructor(
     private cfg: DlklapConfig,
     private log: { debug: (m: string) => void; warn: (m: string) => void; error: (m: string) => void },
-  ) {
-    if (cfg.accountId) this.accountId = cfg.accountId;
-  }
+    private lockName: string,   // used to disambiguate when account has multiple DL100s
+  ) {}
+
+  // Expose resolved identifiers so platform.ts can persist them in accessory context.
+  get resolvedTerminalUUID(): string | undefined { return this.cfg._terminalUUID; }
+  get resolvedDeviceId(): string | undefined { return this.cfg._deviceId; }
 
   async getDeviceInfo(): Promise<DeviceInfo> {
     return this.withSession(async (s) =>
@@ -178,7 +181,7 @@ export class DlklapApi {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await this.ensureToken();
+        await this.ensureIdentifiers();
         // Reuse cached session to skip the cloud control-key round-trip on back-to-back ops.
         // ensureAwake() removed: lock responds to handshake0 directly (~1.1s cold, verified 2026-07-21).
         if (!this._session) {
@@ -199,11 +202,48 @@ export class DlklapApi {
     throw lastErr;
   }
 
+  // Resolve terminalUUID and deviceId on first use; both are then cached in cfg and persisted
+  // by platform.ts into accessory.context so restarts skip the cloud device-list call.
+  private async ensureIdentifiers(): Promise<void> {
+    // terminalUUID: generate once (any UUID works; the cloud just needs a stable app-instance ID).
+    if (!this.cfg._terminalUUID) {
+      this.cfg._terminalUUID = crypto.randomUUID().toUpperCase();
+      this.log.debug(`Generated terminalUUID: ${this.cfg._terminalUUID}`);
+    }
+    // deviceId: discover from cloud device list if not already cached.
+    if (!this.cfg._deviceId) {
+      await this.ensureToken();
+      const res = await req(`https://wap.tplinkcloud.com/?token=${this.token}`, {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'getDeviceList' }),
+      });
+      const r = JSON.parse(res.buf.toString('utf8')) as Json;
+      if (r.error_code !== 0) throw new Error(`getDeviceList failed: ${JSON.stringify(r)}`);
+      const devices: Json[] = r.result?.deviceList ?? [];
+      const dl100s = devices.filter((d) => (d.deviceModel as string)?.includes('DL100'));
+      if (dl100s.length === 0) throw new Error('No DL100 devices found on this TP-Link account.');
+      if (dl100s.length === 1) {
+        this.cfg._deviceId = dl100s[0].deviceId as string;
+      } else {
+        // Multiple DL100s: match by lock name (alias in Tapo app).
+        const match = dl100s.find((d) => (d.alias as string) === this.lockName);
+        if (!match) {
+          throw new Error(
+            `Multiple DL100s found (${dl100s.map((d) => d.alias).join(', ')}). ` +
+            `Set "name" in the plugin config to match the device name in the Tapo app exactly.`,
+          );
+        }
+        this.cfg._deviceId = match.deviceId as string;
+      }
+      this.log.debug(`Resolved deviceId: ${this.cfg._deviceId}`);
+    }
+  }
+
   private async ensureToken(): Promise<void> {
     if (this.token) return;
     const body = { method: 'login', params: {
       appType: 'Tapo_Android', cloudUserName: this.cfg.cloudUsername,
-      cloudPassword: this.cfg.cloudPassword, terminalUUID: this.cfg.terminalUUID,
+      cloudPassword: this.cfg.cloudPassword, terminalUUID: this.cfg._terminalUUID ?? crypto.randomUUID().toUpperCase(),
       refreshTokenNeeded: false } };
     const res = await req('https://wap.tplinkcloud.com/', {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -211,7 +251,7 @@ export class DlklapApi {
     const r = JSON.parse(res.buf.toString('utf8')) as Json;
     if (r.error_code !== 0) throw new Error(`login failed: ${JSON.stringify(r)}`);
     this.token = r.result.token;
-    this.accountId = this.accountId ?? String(r.result.accountId);
+    this.accountId = String(r.result.accountId);
   }
 
   // handshake0 -> cloud control-key -> handshake1/2 -> derive session keys
@@ -234,13 +274,13 @@ export class DlklapApi {
     // this single call skips TLS verification via node:https. The login call
     // above (which carries the account password) stays fully verified.
     const ckRaw = await req(
-      `https://use1-app-server.iot.i.tplinknbu.com/v1/things/${this.cfg.deviceId}/control-key`,
+      `https://use1-app-server.iot.i.tplinknbu.com/v1/things/${this.cfg._deviceId}/control-key`,
       {
         headers: {
           Authorization: `ut|${this.token}`,
-          'app-cid': `app:Tapo_Android:${this.cfg.terminalUUID}`,
+          'app-cid': `app:Tapo_Android:${this.cfg._terminalUUID}`,
           'App-Type': 'Tapo_Android', 'x-app-name': 'Tapo_Android',
-          UUID: this.cfg.terminalUUID, 'Terminal-Id': this.cfg.terminalUUID, 'x-term-id': this.cfg.terminalUUID,
+          UUID: this.cfg._terminalUUID!, 'Terminal-Id': this.cfg._terminalUUID!, 'x-term-id': this.cfg._terminalUUID!,
           Platform: 'ANDROID', 'X-App-Os': 'android', 'Content-Type': 'application/json',
         },
         body: JSON.stringify({ secret, random: rand4.toString('hex').toUpperCase() }),
