@@ -15,6 +15,7 @@ export class LockAccessory {
     private readonly accessory: PlatformAccessory,
     private readonly api: DlklapApi,
     private readonly pollMs: number,
+    private readonly autoLockSeconds: number,   // 0 = unknown/disabled
   ) {
     const { Service: S, Characteristic: C } = this.platform;
 
@@ -112,6 +113,18 @@ export class LockAccessory {
       // 2. Force a fresh (non-coalesced) refresh to get real device state.
       this.refreshing = undefined;
       await this.refresh();
+
+      // 3. If we just unlocked, schedule a follow-up refresh to catch the auto-relock.
+      //    Prefer the device-reported timeout (auto_lock_time); fall back to config.
+      //    Add a 3s buffer to allow for bolt travel time.
+      if (!locked) {
+        const deviceTimeout = typeof this.info?.auto_lock_time === 'number' ? this.info.auto_lock_time : null;
+        const timeoutS = deviceTimeout ?? (this.autoLockSeconds > 0 ? this.autoLockSeconds : null);
+        if (timeoutS !== null) {
+          this.platform.log.debug(`Scheduling relock check in ${timeoutS + 3}s (source: ${deviceTimeout !== null ? 'device' : 'config'}).`);
+          setTimeout(() => { this.refreshing = undefined; void this.refresh(); }, (timeoutS + 3) * 1000);
+        }
+      }
     } catch (e) {
       this.platform.log.error(`setLock failed: ${(e as Error).message}`);
       // Revert optimistic updates on failure.

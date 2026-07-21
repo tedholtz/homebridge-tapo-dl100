@@ -17,6 +17,7 @@ export interface DeviceInfo {
   battery_percentage?: number;
   at_low_battery?: boolean;
   rssi?: number;
+  auto_lock_time?: number;   // device-reported auto-lock timeout in seconds, if supported
   [k: string]: unknown;
 }
 
@@ -155,6 +156,7 @@ class Session {
 export class DlklapApi {
   private token?: string;
   private accountId?: string;
+  private _session?: Session;   // cached session; cleared on any failure to force re-handshake
 
   constructor(
     private cfg: DlklapConfig,
@@ -192,15 +194,20 @@ export class DlklapApi {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         await this.ensureToken();
+        // Reuse cached session to skip the cloud control-key round-trip on back-to-back ops.
         // ensureAwake() removed: lock responds to handshake0 directly (~1.1s cold, verified 2026-07-21).
-        const session = await this.handshake();
-        return await fn(session);
+        if (!this._session) {
+          this._session = await this.handshake();
+          this.log.debug('New DLKLAP session established.');
+        }
+        return await fn(this._session);
       } catch (e) {
         lastErr = e;
+        this._session = undefined;      // force re-handshake on retry
+        this.token = undefined;         // force re-login on retry
         const cause = (e as any)?.cause;
         const causeStr = cause ? ` | cause: ${cause.code ?? ''} ${cause.message ?? cause}` : '';
         this.log.warn(`session attempt ${attempt + 1} failed: ${(e as Error).message}${causeStr}`);
-        this.token = undefined;         // force re-login + fresh handshake
         await sleep(500);
       }
     }
